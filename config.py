@@ -1,9 +1,11 @@
-token: str = "هنا حط توكن البوت اللي من BotFather"
+import os
 
-logs: int | None = None                    # (اختياري) ID قناة اللوج
-max_filesize: int = 50000000               # 50 ميجا (Telegram limit)
+token: str = os.environ.get("8576952079:AAEPXsaVcLX5oXK0T6VUX8Jzgi3mlxIXRwo")
+
+logs: int | None = None
+max_filesize: int = 50000000
 output_folder: str = "/tmp/satoru"
 
-allowed_domains: list[str] = [ ... ]       # (اتركه زي ما هو)
-secret_key: str = "اي-سر-تحبه"
+allowed_domains: list[str] = ["*"]
+secret_key: str = "any-secret-you-like"
 js_runtime: dict | None = {"node": {"path": "node"}}
