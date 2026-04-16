@@ -1,6 +1,6 @@
 import os
 
-token: str = os.environ.get("TOKEN")
+token: str = os.environ.get("BOT_TOKEN")
 
 logs: int | None = None
 max_filesize: int = 50000000
