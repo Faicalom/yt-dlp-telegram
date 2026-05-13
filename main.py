@@ -81,8 +81,6 @@ def is_allowed_domain(url):
     ]
     
     return any(domain in url for domain in allowed)
-    except (ValueError, AttributeError):
-        return False
 
 
 @bot.message_handler(commands=["start", "help"])
