@@ -304,12 +304,14 @@ def handle_private_messages(message: types.Message):
         return
 
     if not is_url(text):
+        bot.reply_to(message, "أرسل رابط صحيح يبدأ بـ http أو https")
         return
 
-    # إظهار الكيبورد (هذا هو الحل)
+    # هنا يظهر الكيبورد (الحل النهائي)
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(types.InlineKeyboardButton("📥 تحميل الفيديو الكامل", callback_data="full"))
     markup.add(types.InlineKeyboardButton("✂️ اقتصاص جزء من الفيديو", callback_data="trim"))
+   
     bot.reply_to(
         message,
         "اختر ماذا تريد:",
