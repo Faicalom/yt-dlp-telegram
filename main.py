@@ -72,12 +72,13 @@ def is_allowed_domain(url):
     url = url.lower().strip()
     
     allowed = [
-        "youtube.com", "youtu.be",           # YouTube
-        "tiktok.com", "vt.tiktok.com",       # TikTok (short links)
-        "instagram.com", "instagr.am",       # Instagram
-        "twitter.com", "x.com",              # Twitter / X
-        "bluesky",                           # Bluesky
-        "dailymotion.com",                   # Dailymotion
+        "youtube.com", "youtu.be",
+        "tiktok.com", "vt.tiktok.com",       # TikTok short links
+        "instagram.com", "instagr.am",
+        "twitter.com", "x.com",
+        "bluesky",
+        "dailymotion.com",
+        "facebook.com",
     ]
     
     return any(domain in url for domain in allowed)
