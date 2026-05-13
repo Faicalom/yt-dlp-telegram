@@ -65,19 +65,22 @@ def youtube_url_validation(url):
 
 
 def is_allowed_domain(url):
-    """
-    Check if URL belongs to allowed domains: YouTube, TikTok, Instagram, Twitter/X, Bluesky
-    """
-
-    try:
-        parsed_url = urlparse(url)
-        domain = parsed_url.netloc.lower()
-
-        # Remove port if present
-        if ":" in domain:
-            domain = domain.split(":")[0]
-
-        return domain in config.allowed_domains
+    """Check if URL belongs to allowed domains: YouTube, TikTok, Instagram, Twitter/X, Bluesky"""
+    if not url or not isinstance(url, str):
+        return False
+    
+    url = url.lower().strip()
+    
+    allowed = [
+        "youtube.com", "youtu.be",           # YouTube
+        "tiktok.com", "vt.tiktok.com",       # TikTok (short links)
+        "instagram.com", "instagr.am",       # Instagram
+        "twitter.com", "x.com",              # Twitter / X
+        "bluesky",                           # Bluesky
+        "dailymotion.com",                   # Dailymotion
+    ]
+    
+    return any(domain in url for domain in allowed)
     except (ValueError, AttributeError):
         return False
 
