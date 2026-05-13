@@ -292,14 +292,29 @@ def get_text(message):
         return message.text.split(" ")[1]
 
 
-@bot.message_handler(commands=["download"])
-def download_command(message):
-    text = get_text(message)
-    if not text:
-        bot.reply_to(
-            message, "Invalid usage, use `/download url`", parse_mode="MARKDOWN"
-        )
+@bot.message_handler(
+    func=lambda m: True,
+    content_types=["text", "photo", "audio", "video", "document"],
+)
+def handle_private_messages(message: types.Message):
+    text = (
+        message.text if message.text else message.caption if message.caption else None
+    )
+    if message.chat.type != "private" or not text:
         return
+
+    if not is_url(text):
+        return
+
+    # إظهار الكيبورد (هذا هو الحل)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("📥 تحميل الفيديو الكامل", callback_data="full"))
+    markup.add(types.InlineKeyboardButton("✂️ اقتصاص جزء من الفيديو", callback_data="trim"))
+    bot.reply_to(
+        message,
+        "اختر ماذا تريد:",
+        reply_markup=markup
+    )
 
     log(message, text, "video")
     download_video(message, text)
