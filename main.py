@@ -82,7 +82,12 @@ def is_allowed_domain(url):
     ]
     
     return any(domain in url for domain in allowed)
-
+def is_url(text: str) -> bool:
+    """Check if text is a valid URL"""
+    if not text:
+        return False
+    text = text.strip().lower()
+    return text.startswith(("http://", "https://"))
 
 @bot.message_handler(commands=["start", "help"])
 def test(message):
