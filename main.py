@@ -18,14 +18,13 @@ from yt_dlp.utils import DownloadError, ExtractorError
 
 import config
 
-# ========================== SETTINGS (2GB SUPPORT) ==========================
+# ========================== 2GB MODE ==========================
 os.makedirs(config.output_folder, exist_ok=True)
 
 UPLOAD_LIMIT_BYTES = 2 * 1024 * 1024 * 1024   # 2GB
-REQUEST_TIMEOUT = 3600                        # 1 ساعة (مهم للملفات الكبيرة)
+REQUEST_TIMEOUT = 3600                        # 1 ساعة
 MAX_DOWNLOAD_BYTES = UPLOAD_LIMIT_BYTES
 
-# ========================== DOMAIN CHECKER ==========================
 def is_allowed_domain(url):
     if not url or not isinstance(url, str):
         return False
@@ -33,7 +32,6 @@ def is_allowed_domain(url):
     domains = ["youtu", "youtube", "tiktok", "instagram", "twitter", "x.com", "facebook", "fb.watch", "fb.com", "dailymotion", "bsky"]
     return any(d in lower for d in domains)
 
-# ========================== CRYPTO + DB ==========================
 key = hashlib.sha256(getattr(config, "secret_key", "any-secret-you-like").encode()).digest()
 cipher = Fernet(base64.urlsafe_b64encode(key))
 
@@ -52,7 +50,6 @@ db_conn.commit()
 bot = telebot.TeleBot(config.token)
 last_edited = {}
 
-# ========================== HELPERS ==========================
 def encrypt_cookie(cookie_data: str) -> str:
     return cipher.encrypt(cookie_data.encode()).decode()
 
@@ -93,7 +90,9 @@ def _safe_file_size(path: str) -> int:
     except OSError:
         return 0
 
-def _get_downloaded_filepath(info: Any) -> Optional[str]:
+def _get_downloaded_filepath(info: Any, video_title: int) -> Optional[str]:
+    """أقوى طريقة + fallback search في المجلد"""
+    # 1. من info dict
     for k in ("requested_downloads", "entries"):
         items = info.get(k) or []
         if items and isinstance(items, list):
@@ -102,7 +101,24 @@ def _get_downloaded_filepath(info: Any) -> Optional[str]:
                     fp = item.get(key)
                     if fp and os.path.exists(fp):
                         return fp
-    return info.get("filepath") or info.get("__final_filename__")
+    fp = info.get("filepath") or info.get("__final_filename__")
+    if fp and os.path.exists(fp):
+        return fp
+
+    # 2. Fallback: ابحث في المجلد عن أكبر ملف يبدأ بـ video_title
+    try:
+        candidates = []
+        for file in os.listdir(config.output_folder):
+            if str(video_title) in file:
+                full_path = os.path.join(config.output_folder, file)
+                size = _safe_file_size(full_path)
+                candidates.append((size, full_path))
+        if candidates:
+            candidates.sort(reverse=True)  # أكبر ملف أولاً
+            return candidates[0][1]
+    except Exception:
+        pass
+    return None
 
 def _send_as_document(message, filepath: str):
     with open(filepath, "rb") as f:
@@ -114,17 +130,16 @@ def _send_as_document(message, filepath: str):
             timeout=REQUEST_TIMEOUT,
         )
 
-def _send_media(message, info: Any, audio: bool):
-    filepath = _get_downloaded_filepath(info)
+def _send_media(message, info: Any, audio: bool, video_title: int):
+    filepath = _get_downloaded_filepath(info, video_title)
     if not filepath or not os.path.exists(filepath):
-        raise RuntimeError("Downloaded file path not found")
+        raise RuntimeError(f"Downloaded file path not found (searched for {video_title})")
 
     size = _safe_file_size(filepath)
     if size > UPLOAD_LIMIT_BYTES:
         raise RuntimeError(f"File too large ({round(size / 1024 / 1024 / 1024, 1)}GB)")
 
-    # Always send as document for files > 50MB (Telegram allows 2GB as document)
-    _send_as_document(message, filepath)
+    _send_as_document(message, filepath)   # دايماً document للملفات الكبيرة
 
 def _cleanup(video_title: int):
     try:
@@ -148,10 +163,9 @@ def check_url(content: str, message):
     return {"success": True, "url": url}
 
 def _build_default_format_selector(audio: bool):
-    """High quality + 2GB support"""
     if audio:
         return "bestaudio/best"
-    return "bestvideo+bestaudio/best"   # أعلى جودة ممكنة (الحد 2GB)
+    return "bestvideo+bestaudio/best"   # أعلى جودة (2GB mode)
 
 def download_video(message, content, audio=False, format_id=None):
     check = check_url(content, message)
@@ -195,29 +209,24 @@ def download_video(message, content, audio=False, format_id=None):
             info = ydl.extract_info(url, download=True)
 
         bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text="Sending to Telegram (2GB mode)...")
-        _send_media(message, info, audio)
+        _send_media(message, info, audio, video_title)
         bot.delete_message(message.chat.id, msg.message_id)
 
     except (DownloadError, ExtractorError) as e:
         err = str(e).lower()
-        if "larger than max-filesize" in err:
-            text = "File too large even for 2GB limit. Try /custom."
-        elif any(x in err for x in ["login", "sign in", "rate-limit"]):
-            text = "Rate limit or login required.\n\nارسل /cookie + ملف cookies.txt"
-        else:
-            text = "Download error, try again."
+        text = "File too large. Use /custom." if "filesize" in err else "Download error, try again."
         bot.edit_message_text(text, message.chat.id, msg.message_id)
 
     except Exception as e:
-        print("Unexpected error:", e)
-        bot.edit_message_text("Couldn't send file. Try /custom.", message.chat.id, msg.message_id)
+        print("Unexpected error:", str(e))
+        bot.edit_message_text("Couldn't send file. Try /custom for smaller quality.", message.chat.id, msg.message_id)
 
     finally:
         if cookie_file and os.path.exists(cookie_file):
             os.remove(cookie_file)
         _cleanup(video_title)
 
-# ========================== باقي الكود (نفس السابق) ==========================
+# باقي الكود (log, get_text, commands, custom, cookies, callback, handle_private_messages) نفس السابق بدون تغيير
 def log(message, text: str, media: str):
     if getattr(config, "logs", None):
         chat_info = "Private chat" if message.chat.type == "private" else f"Group: *{message.chat.title}* (`{message.chat.id}`)"
@@ -344,5 +353,5 @@ def handle_private_messages(message: types.Message):
     download_video(message, text)
 
 me = bot.get_me()
-print(f"ready as @{me.username} — 2GB MODE ACTIVATED ✅ (Facebook + Dailymotion high quality now works)")
+print(f"ready as @{me.username} — 2GB + PATH FIX ACTIVATED ✅ (large files now work)")
 bot.infinity_polling()
