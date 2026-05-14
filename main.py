@@ -5,7 +5,7 @@ import os
 import re
 import sqlite3
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -18,21 +18,58 @@ from yt_dlp.utils import DownloadError, ExtractorError
 
 import config
 
+
+# ----------------------------
+# Settings
+# ----------------------------
 os.makedirs(config.output_folder, exist_ok=True)
 
-key = hashlib.sha256(config.secret_key.encode()).digest()
+UPLOAD_LIMIT_BYTES = int(getattr(config, "upload_limit_bytes", 90 * 1024 * 1024))
+REQUEST_TIMEOUT = int(getattr(config, "request_timeout", 1200))
+
+# Hard cap for yt-dlp download size too, so we do not waste time on huge files.
+MAX_DOWNLOAD_BYTES = int(getattr(config, "max_filesize", UPLOAD_LIMIT_BYTES) or UPLOAD_LIMIT_BYTES)
+MAX_DOWNLOAD_BYTES = min(MAX_DOWNLOAD_BYTES, UPLOAD_LIMIT_BYTES)
+
+ALLOWED_DOMAINS = getattr(
+    config,
+    "allowed_domains",
+    [
+        "youtube.com",
+        "youtu.be",
+        "tiktok.com",
+        "vt.tiktok.com",
+        "instagram.com",
+        "instagr.am",
+        "twitter.com",
+        "x.com",
+        "bluesky",
+        "dailymotion.com",
+        "facebook.com",
+    ],
+)
+
+SECRET_KEY = getattr(config, "secret_key", "any-secret-you-like")
+
+
+# ----------------------------
+# Crypto / DB
+# ----------------------------
+key = hashlib.sha256(SECRET_KEY.encode()).digest()
 cipher = Fernet(base64.urlsafe_b64encode(key))
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
 db_path = os.path.join(script_dir, "db.db")
 db_conn = sqlite3.connect(db_path, check_same_thread=False)
 db_cursor = db_conn.cursor()
-db_cursor.execute("""
+db_cursor.execute(
+    """
     CREATE TABLE IF NOT EXISTS user_cookies (
         user_id INTEGER PRIMARY KEY,
         cookie_data TEXT NOT NULL
     )
-""")
+"""
+)
 db_conn.commit()
 
 ses = requests.Session()
@@ -40,6 +77,9 @@ bot = telebot.TeleBot(config.token)
 last_edited = {}
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def encrypt_cookie(cookie_data: str) -> str:
     return cipher.encrypt(cookie_data.encode()).decode()
 
@@ -54,11 +94,9 @@ def youtube_url_validation(url):
         r"(youtube|youtu|youtube-nocookie)\.(com|be)/"
         r"(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})"
     )
-
     youtube_regex_match = re.match(youtube_regex, url)
     if youtube_regex_match:
         return youtube_regex_match
-
     return youtube_regex_match
 
 
@@ -68,18 +106,7 @@ def is_allowed_domain(url):
         return False
 
     url = url.lower().strip()
-
-    allowed = [
-        "youtube.com", "youtu.be",
-        "tiktok.com", "vt.tiktok.com",
-        "instagram.com", "instagr.am",
-        "twitter.com", "x.com",
-        "bluesky",
-        "dailymotion.com",
-        "facebook.com",
-    ]
-
-    return any(domain in url for domain in allowed)
+    return any(domain in url for domain in ALLOWED_DOMAINS)
 
 
 def is_url(text: str) -> bool:
@@ -153,6 +180,27 @@ def _make_progress_hook(message, msg) -> Callable:
     return progress
 
 
+def _safe_file_size(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _get_downloaded_filepath(info: Any) -> Optional[str]:
+    downloads = info.get("requested_downloads") or []
+    if downloads:
+        fp = downloads[0].get("filepath")
+        if fp:
+            return fp
+
+    fp = info.get("filepath")
+    if fp:
+        return fp
+
+    return None
+
+
 def _send_as_document(message, filepath: str) -> None:
     with open(filepath, "rb") as f:
         bot.send_document(
@@ -160,31 +208,48 @@ def _send_as_document(message, filepath: str) -> None:
             f,
             reply_to_message_id=message.message_id,
             visible_file_name=os.path.basename(filepath),
+            timeout=REQUEST_TIMEOUT,
         )
 
 
 def _send_media(message, info: Any, audio: bool) -> None:
     """Send the downloaded file back to the user via Telegram."""
-    downloads = info.get("requested_downloads") or []
-    if not downloads:
-        raise RuntimeError("No downloaded file found")
-
-    filepath = downloads[0].get("filepath")
+    filepath = _get_downloaded_filepath(info)
     if not filepath or not os.path.exists(filepath):
         raise RuntimeError("Downloaded file path not found")
+
+    size = _safe_file_size(filepath)
+    if size and size > UPLOAD_LIMIT_BYTES:
+        raise RuntimeError(
+            f"File too large for Telegram upload ({round(size / 1024 / 1024)}MB)"
+        )
 
     try:
         if audio:
             with open(filepath, "rb") as f:
-                bot.send_audio(
-                    message.chat.id,
-                    f,
-                    reply_to_message_id=message.message_id,
-                )
+                try:
+                    bot.send_audio(
+                        message.chat.id,
+                        f,
+                        reply_to_message_id=message.message_id,
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    return
+                except Exception:
+                    f.seek(0)
+                    bot.send_document(
+                        message.chat.id,
+                        f,
+                        reply_to_message_id=message.message_id,
+                        visible_file_name=os.path.basename(filepath),
+                        timeout=REQUEST_TIMEOUT,
+                    )
+                    return
         else:
-            # Sending as document is much more reliable than video for many sources
-            # and avoids Telegram video re-encoding/codec problems.
+            # Document is more reliable than video for many sources and avoids
+            # Telegram video re-encoding / codec mismatch problems.
             _send_as_document(message, filepath)
+
     except Exception as e:
         print("send failed:", e)
         raise
@@ -220,7 +285,21 @@ def check_url(content: str, message) -> dict:
     return {"success": True, "url": url}
 
 
-def download_video(message, content, audio=False, format_id="mp4") -> None:
+def _build_default_format_selector(audio: bool) -> str:
+    if audio:
+        return "bestaudio/best"
+
+    limit_mb = max(1, UPLOAD_LIMIT_BYTES // (1024 * 1024))
+    # Prefer a smaller file first, then a smaller approximate size, then the worst
+    # available quality rather than risking a huge upload.
+    return (
+        f"best[filesize<{limit_mb}M]/"
+        f"best[filesize_approx<{limit_mb}M]/"
+        f"worst"
+    )
+
+
+def download_video(message, content, audio=False, format_id=None) -> None:
     check = check_url(content, message)
     if not check["success"]:
         return
@@ -234,11 +313,15 @@ def download_video(message, content, audio=False, format_id="mp4") -> None:
     )
     video_title = round(time.time() * 1000)
 
+    resolved_format = format_id
+    if not resolved_format or resolved_format == "mp4":
+        resolved_format = _build_default_format_selector(audio)
+
     ydl_opts: yt_dlp._Params = {
-        "format": format_id,
+        "format": resolved_format,
         "outtmpl": f"{config.output_folder}/{video_title}.%(ext)s",
         "progress_hooks": [_make_progress_hook(message, msg)],
-        "max_filesize": config.max_filesize,
+        "max_filesize": MAX_DOWNLOAD_BYTES,
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}]
         if audio
         else [],
@@ -246,7 +329,7 @@ def download_video(message, content, audio=False, format_id="mp4") -> None:
         "remote_components": {"ejs:github"},
     }
 
-    if config.js_runtime:
+    if getattr(config, "js_runtime", None):
         ydl_opts["js_runtimes"] = config.js_runtime
         ydl_opts["remote_components"] = {"ejs:github"}
 
@@ -268,14 +351,28 @@ def download_video(message, content, audio=False, format_id="mp4") -> None:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-            bot.edit_message_text(
-                chat_id=message.chat.id,
-                message_id=msg.message_id,
-                text="Sending file to Telegram...",
-            )
+        filepath = _get_downloaded_filepath(info)
+        if filepath and os.path.exists(filepath):
+            size = _safe_file_size(filepath)
+            if size > UPLOAD_LIMIT_BYTES:
+                bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=msg.message_id,
+                    text=(
+                        f"File is too large to upload here ({round(size / 1024 / 1024)}MB).\n"
+                        f"Use /custom and pick a smaller format."
+                    ),
+                )
+                return
 
-            _send_media(message, info, audio)
-            bot.delete_message(message.chat.id, msg.message_id)
+        bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=msg.message_id,
+            text="Sending file to Telegram...",
+        )
+
+        _send_media(message, info, audio)
+        bot.delete_message(message.chat.id, msg.message_id)
 
     except (DownloadError, ExtractorError) as e:
         err = str(e).lower()
@@ -284,6 +381,8 @@ def download_video(message, content, audio=False, format_id="mp4") -> None:
             text = "We're sorry, YouTube is ratelimiting third party downloaders right now, try again later."
         elif "login required" in err or "rate-limit reached" in err:
             text = "Content not available (Rate limit or login required)."
+        elif "no video formats" in err or "format" in err:
+            text = "No suitable small format was found. Try /custom and choose a lower quality."
         else:
             text = "There was an error downloading the video, please try again later."
 
@@ -307,7 +406,7 @@ def download_video(message, content, audio=False, format_id="mp4") -> None:
 
 
 def log(message, text: str, media: str):
-    if config.logs:
+    if getattr(config, "logs", None):
         if message.chat.type == "private":
             chat_info = "Private chat"
         else:
@@ -385,7 +484,7 @@ def filter_cookies_by_domain(cookie_data: str) -> str:
         domain = parts[0].lstrip(".")
 
         is_allowed = False
-        for allowed_domain in config.allowed_domains:
+        for allowed_domain in ALLOWED_DOMAINS:
             if domain == allowed_domain or domain.endswith("." + allowed_domain):
                 is_allowed = True
                 break
@@ -436,6 +535,7 @@ def handle_cookie(message):
                         reply_to_message_id=message.message_id,
                         visible_file_name="cookies.txt",
                         reply_markup=markup,
+                        timeout=REQUEST_TIMEOUT,
                     )
             finally:
                 if os.path.exists(cookie_file):
