@@ -18,14 +18,14 @@ from yt_dlp.utils import DownloadError, ExtractorError
 
 import config
 
-# ========================== SETTINGS ==========================
+# ========================== SETTINGS (2GB SUPPORT) ==========================
 os.makedirs(config.output_folder, exist_ok=True)
 
-UPLOAD_LIMIT_BYTES = 90 * 1024 * 1024
-REQUEST_TIMEOUT = 1800
-MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024   # أقوى حد 40MB فقط (Replit + Telegram)
+UPLOAD_LIMIT_BYTES = 2 * 1024 * 1024 * 1024   # 2GB
+REQUEST_TIMEOUT = 3600                        # 1 ساعة (مهم للملفات الكبيرة)
+MAX_DOWNLOAD_BYTES = UPLOAD_LIMIT_BYTES
 
-# ========================== BULLETPROOF DOMAIN ==========================
+# ========================== DOMAIN CHECKER ==========================
 def is_allowed_domain(url):
     if not url or not isinstance(url, str):
         return False
@@ -70,7 +70,7 @@ def _make_progress_hook(message, msg):
             return
         try:
             last = last_edited.get(f"{message.chat.id}-{msg.message_id}")
-            if last and (datetime.datetime.now() - last).total_seconds() < 10:   # throttle 10 ثانية
+            if last and (datetime.datetime.now() - last).total_seconds() < 8:
                 return
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes") or 0
@@ -84,7 +84,7 @@ def _make_progress_hook(message, msg):
             )
             last_edited[f"{message.chat.id}-{msg.message_id}"] = datetime.datetime.now()
         except Exception:
-            pass  # ignore "message not modified"
+            pass
     return progress
 
 def _safe_file_size(path: str) -> int:
@@ -94,7 +94,6 @@ def _safe_file_size(path: str) -> int:
         return 0
 
 def _get_downloaded_filepath(info: Any) -> Optional[str]:
-    """أقوى طريقة لجلب المسار (fix path not found)"""
     for k in ("requested_downloads", "entries"):
         items = info.get(k) or []
         if items and isinstance(items, list):
@@ -122,28 +121,10 @@ def _send_media(message, info: Any, audio: bool):
 
     size = _safe_file_size(filepath)
     if size > UPLOAD_LIMIT_BYTES:
-        raise RuntimeError(f"File too large ({round(size / 1024 / 1024)}MB)")
+        raise RuntimeError(f"File too large ({round(size / 1024 / 1024 / 1024, 1)}GB)")
 
-    try:
-        if audio:
-            with open(filepath, "rb") as f:
-                try:
-                    bot.send_audio(message.chat.id, f, reply_to_message_id=message.message_id, timeout=REQUEST_TIMEOUT)
-                except:
-                    f.seek(0)
-                    _send_as_document(message, filepath)
-            return
-
-        try:
-            with open(filepath, "rb") as f:
-                bot.send_video(message.chat.id, f, reply_to_message_id=message.message_id, supports_streaming=True, timeout=REQUEST_TIMEOUT)
-            return
-        except Exception:
-            bot.send_message(message.chat.id, "Trying document fallback...", reply_to_message_id=message.message_id)
-            _send_as_document(message, filepath)
-    except Exception as e:
-        print("send failed:", e)
-        raise
+    # Always send as document for files > 50MB (Telegram allows 2GB as document)
+    _send_as_document(message, filepath)
 
 def _cleanup(video_title: int):
     try:
@@ -167,15 +148,10 @@ def check_url(content: str, message):
     return {"success": True, "url": url}
 
 def _build_default_format_selector(audio: bool):
-    """SUPER AGGRESSIVE لـ Facebook (40MB max + low quality)"""
+    """High quality + 2GB support"""
     if audio:
         return "bestaudio/best"
-    return (
-        "bestvideo[height<=360][filesize<40M]+bestaudio/"
-        "bestvideo[height<=240][filesize<40M]+bestaudio/"
-        "best[height<=360][filesize<40M]/"
-        "best[filesize<40M]/worst"
-    )
+    return "bestvideo+bestaudio/best"   # أعلى جودة ممكنة (الحد 2GB)
 
 def download_video(message, content, audio=False, format_id=None):
     check = check_url(content, message)
@@ -183,7 +159,7 @@ def download_video(message, content, audio=False, format_id=None):
         return
 
     url = check["url"]
-    msg = bot.reply_to(message, "Downloading...\n\n<i>Want to stay updated? @SatoruStatus</i>", parse_mode="HTML")
+    msg = bot.reply_to(message, "Downloading (up to 2GB)...\n\n<i>Want to stay updated? @SatoruStatus</i>", parse_mode="HTML")
     video_title = round(time.time() * 1000)
 
     resolved_format = format_id or _build_default_format_selector(audio)
@@ -195,13 +171,12 @@ def download_video(message, content, audio=False, format_id=None):
         "max_filesize": MAX_DOWNLOAD_BYTES,
         "noplaylist": True,
         "merge_output_format": "mp4",
-        "retries": 20,
-        "extractor_retries": 20,
-        "format_sort": ["filesize", "height:360", "width"],   # مهم جداً لـ Facebook
+        "retries": 30,
+        "extractor_retries": 30,
+        "format_sort": ["filesize", "height", "width"],
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}] if audio else [],
         "prefer_free_formats": True,
         "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        "concurrent_fragment_downloads": 4,
     }
 
     cookie_file = None
@@ -219,14 +194,14 @@ def download_video(message, content, audio=False, format_id=None):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text="Sending to Telegram...")
+        bot.edit_message_text(chat_id=message.chat.id, message_id=msg.message_id, text="Sending to Telegram (2GB mode)...")
         _send_media(message, info, audio)
         bot.delete_message(message.chat.id, msg.message_id)
 
     except (DownloadError, ExtractorError) as e:
         err = str(e).lower()
-        if "larger than max-filesize" in err or "filesize" in err:
-            text = "File too large. Use /custom and choose smaller quality."
+        if "larger than max-filesize" in err:
+            text = "File too large even for 2GB limit. Try /custom."
         elif any(x in err for x in ["login", "sign in", "rate-limit"]):
             text = "Rate limit or login required.\n\nارسل /cookie + ملف cookies.txt"
         else:
@@ -235,7 +210,7 @@ def download_video(message, content, audio=False, format_id=None):
 
     except Exception as e:
         print("Unexpected error:", e)
-        bot.edit_message_text("Couldn't send file. Try /custom for smaller quality.", message.chat.id, msg.message_id)
+        bot.edit_message_text("Couldn't send file. Try /custom.", message.chat.id, msg.message_id)
 
     finally:
         if cookie_file and os.path.exists(cookie_file):
@@ -369,5 +344,5 @@ def handle_private_messages(message: types.Message):
     download_video(message, text)
 
 me = bot.get_me()
-print(f"ready as @{me.username} — Facebook 471MB BUG KILLED ✅ (40MB strict + format_sort)")
+print(f"ready as @{me.username} — 2GB MODE ACTIVATED ✅ (Facebook + Dailymotion high quality now works)")
 bot.infinity_polling()
