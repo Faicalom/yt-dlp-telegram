@@ -181,21 +181,13 @@ def _send_media(message, info: Any, audio: bool) -> None:
                     f,
                     reply_to_message_id=message.message_id,
                 )
-            return
-
-        # Try normal video send first
-        with open(filepath, "rb") as f:
-            bot.send_video(
-                message.chat.id,
-                f,
-                reply_to_message_id=message.message_id,
-                width=downloads[0].get("width"),
-                height=downloads[0].get("height"),
-                supports_streaming=True,
-            )
+        else:
+            # Sending as document is much more reliable than video for many sources
+            # and avoids Telegram video re-encoding/codec problems.
+            _send_as_document(message, filepath)
     except Exception as e:
-        print("send_video/send_audio failed, fallback to document:", e)
-        _send_as_document(message, filepath)
+        print("send failed:", e)
+        raise
 
 
 def _cleanup(video_title: int) -> None:
@@ -300,7 +292,7 @@ def download_video(message, content, audio=False, format_id="mp4") -> None:
     except Exception as e:
         print("Unexpected error:", e)
         bot.edit_message_text(
-            f"Couldn't send file — trying document fallback. If the file is too large, try a smaller quality.",
+            "Couldn't send file. Try a smaller quality or another source.",
             message.chat.id,
             msg.message_id,
         )
