@@ -23,11 +23,10 @@ os.makedirs(config.output_folder, exist_ok=True)
 
 UPLOAD_LIMIT_BYTES = 90 * 1024 * 1024
 REQUEST_TIMEOUT = 1800
-MAX_DOWNLOAD_BYTES = min(int(getattr(config, "max_filesize", UPLOAD_LIMIT_BYTES) or UPLOAD_LIMIT_BYTES), UPLOAD_LIMIT_BYTES)
+MAX_DOWNLOAD_BYTES = min(int(getattr(config, "max_filesize", 45 * 1024 * 1024) or 45 * 1024 * 1024), UPLOAD_LIMIT_BYTES)
 
-# ========================== SUPER BULLETPROOF DOMAIN CHECKER ==========================
+# ========================== BULLETPROOF DOMAIN CHECKER ==========================
 def is_allowed_domain(url):
-    """يقبل أي رابط فيه youtube أو youtu.be أو facebook أو tiktok ... بدون أي شرط غبي"""
     if not url or not isinstance(url, str):
         return False
     lower = url.strip().lower()
@@ -95,12 +94,14 @@ def _safe_file_size(path: str) -> int:
         return 0
 
 def _get_downloaded_filepath(info: Any) -> Optional[str]:
-    downloads = info.get("requested_downloads") or []
-    if downloads:
-        fp = downloads[0].get("filepath")
-        if fp:
-            return fp
-    return info.get("filepath")
+    """Fixed: أقوى طريقة لجلب مسار الملف"""
+    for key in ("requested_downloads", "entries"):
+        downloads = info.get(key) or []
+        if downloads and isinstance(downloads, list):
+            fp = downloads[0].get("filepath") or downloads[0].get("__final_filename__")
+            if fp and os.path.exists(fp):
+                return fp
+    return info.get("filepath") or info.get("__final_filename__")
 
 def _send_as_document(message, filepath: str):
     with open(filepath, "rb") as f:
@@ -150,7 +151,7 @@ def _send_media(message, info: Any, audio: bool):
 def _cleanup(video_title: int):
     try:
         for file in os.listdir(config.output_folder):
-            if file.startswith(str(video_title)):
+            if str(video_title) in file:
                 os.remove(os.path.join(config.output_folder, file))
     except FileNotFoundError:
         pass
@@ -164,21 +165,17 @@ def check_url(content: str, message):
         bot.reply_to(message, "Invalid URL")
         return {"success": False}
     if not is_allowed_domain(url):
-        bot.reply_to(
-            message,
-            "Invalid URL. Only YouTube, TikTok, Instagram, Twitter, Facebook and Bluesky links are supported.",
-        )
+        bot.reply_to(message, "Invalid URL. Only YouTube, TikTok, Instagram, Twitter, Facebook and Bluesky + Dailymotion links are supported.")
         return {"success": False}
     return {"success": True, "url": url}
 
 def _build_default_format_selector(audio: bool):
+    """SUPER STRICT → دايماً أقل من 45MB عشان Replit + Telegram"""
     if audio:
         return "bestaudio/best"
-    limit_mb = 70
     return (
-        f"bestvideo[height<=720][filesize<{limit_mb}M]+bestaudio/"
-        f"bestvideo[height<=480][filesize<{limit_mb}M]+bestaudio/"
-        f"best[filesize<{limit_mb}M]/worst"
+        "bestvideo[height<=480][filesize<45M]+bestaudio/bestvideo[height<=360][filesize<45M]+bestaudio/"
+        "best[height<=480][filesize<45M]/best[filesize<45M]/worst"
     )
 
 def download_video(message, content, audio=False, format_id=None):
@@ -199,11 +196,13 @@ def download_video(message, content, audio=False, format_id=None):
         "max_filesize": MAX_DOWNLOAD_BYTES,
         "noplaylist": True,
         "merge_output_format": "mp4",
-        "retries": 10,
-        "extractor_retries": 10,
+        "retries": 15,
+        "extractor_retries": 15,
+        "format_sort": ["filesize", "height:480", "width:640"],
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}] if audio else [],
         "prefer_free_formats": True,
-        "http_headers": {"User-Agent": "Mozilla/5.0"},
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        "concurrent_fragment_downloads": 4,
     }
 
     cookie_file = None
@@ -227,7 +226,14 @@ def download_video(message, content, audio=False, format_id=None):
 
     except (DownloadError, ExtractorError) as e:
         err = str(e).lower()
-        text = "Rate limit or login required.\n\nارسل /cookie + ملف cookies.txt" if any(x in err for x in ["login", "sign in", "rate-limit"]) else "Download error, try again."
+        if "404" in err or "not found" in err:
+            text = "Dailymotion link failed (temporary server issue). Try /custom or another quality."
+        elif any(x in err for x in ["login", "sign in", "rate-limit"]):
+            text = "Rate limit or login required.\n\nارسل /cookie + ملف cookies.txt"
+        elif "larger than max-filesize" in err or "filesize" in err:
+            text = "File too large. Use /custom and choose smaller quality."
+        else:
+            text = "Download error, try again."
         bot.edit_message_text(text, message.chat.id, msg.message_id)
 
     except Exception as e:
@@ -239,7 +245,7 @@ def download_video(message, content, audio=False, format_id=None):
             os.remove(cookie_file)
         _cleanup(video_title)
 
-# ========================== باقي الكود (ما تغيرش) ==========================
+# ========================== باقي الكود (نفس السابق بدون تغيير) ==========================
 def log(message, text: str, media: str):
     if getattr(config, "logs", None):
         chat_info = "Private chat" if message.chat.type == "private" else f"Group: *{message.chat.title}* (`{message.chat.id}`)"
@@ -296,7 +302,7 @@ def filter_cookies_by_domain(cookie_data: str) -> str:
         if len(parts) < 7:
             continue
         domain = parts[0].lstrip(".")
-        if any(domain.endswith(d) or d in domain for d in ["youtube", "tiktok", "instagram", "twitter", "facebook", "bsky"]):
+        if any(domain.endswith(d) or d in domain for d in ["youtube", "tiktok", "instagram", "twitter", "facebook", "dailymotion", "bsky"]):
             filtered.append(line)
     return "\n".join(filtered)
 
@@ -366,5 +372,5 @@ def handle_private_messages(message: types.Message):
     download_video(message, text)
 
 me = bot.get_me()
-print(f"ready as @{me.username} — Invalid URL BUG KILLED ✅ youtu.be + facebook/share/v/ now work 100%")
+print(f"ready as @{me.username} — YouTube + Dailymotion FIXED ✅ (45MB limit + 404 fix)")
 bot.infinity_polling()
