@@ -18,16 +18,19 @@ from yt_dlp.utils import DownloadError, ExtractorError
 
 import config
 
-
 # ----------------------------
 # Settings
 # ----------------------------
 os.makedirs(config.output_folder, exist_ok=True)
 
+# Maximum file we allow ourselves to attempt uploading to Telegram.
+# Telegram may still refuse some files depending on type/codec/network.
 UPLOAD_LIMIT_BYTES = int(getattr(config, "upload_limit_bytes", 90 * 1024 * 1024))
+
+# Hard timeout for Telegram upload/download requests.
 REQUEST_TIMEOUT = int(getattr(config, "request_timeout", 1200))
 
-# Hard cap for yt-dlp download size too, so we do not waste time on huge files.
+# Use the smaller of config.max_filesize and our upload limit to avoid wasting time.
 MAX_DOWNLOAD_BYTES = int(getattr(config, "max_filesize", UPLOAD_LIMIT_BYTES) or UPLOAD_LIMIT_BYTES)
 MAX_DOWNLOAD_BYTES = min(MAX_DOWNLOAD_BYTES, UPLOAD_LIMIT_BYTES)
 
@@ -37,20 +40,25 @@ ALLOWED_DOMAINS = getattr(
     [
         "youtube.com",
         "youtu.be",
+        "m.youtube.com",
+        "youtube-nocookie.com",
         "tiktok.com",
         "vt.tiktok.com",
         "instagram.com",
         "instagr.am",
         "twitter.com",
         "x.com",
-        "bluesky",
-        "dailymotion.com",
         "facebook.com",
+        "fb.watch",
+        "m.facebook.com",
+        "web.facebook.com",
+        "dailymotion.com",
+        "bsky.app",
+        "bluesky",
     ],
 )
 
 SECRET_KEY = getattr(config, "secret_key", "any-secret-you-like")
-
 
 # ----------------------------
 # Crypto / DB
@@ -105,8 +113,17 @@ def is_allowed_domain(url):
     if not url or not isinstance(url, str):
         return False
 
-    url = url.lower().strip()
-    return any(domain in url for domain in ALLOWED_DOMAINS)
+    parsed = urlparse(url.strip().lower())
+    host = parsed.netloc.split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+
+    for domain in ALLOWED_DOMAINS:
+        domain = domain.lower().strip()
+        if host == domain or host.endswith("." + domain):
+            return True
+
+    return False
 
 
 def is_url(text: str) -> bool:
@@ -164,11 +181,12 @@ def _make_progress_hook(message, msg) -> Callable:
             downloaded = d.get("downloaded_bytes") or 0
             perc = round(downloaded * 100 / total) if total else 0
 
+            title = d.get("info_dict", {}).get("title", "file")
             bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=msg.message_id,
                 text=(
-                    f"Downloading {d['info_dict'].get('title', 'file')}\n\n{perc}%\n\n"
+                    f"Downloading {title}\n\n{perc}%\n\n"
                     f"<i>Want to stay updated? @SatoruStatus</i>"
                 ),
                 parse_mode="HTML",
@@ -234,7 +252,6 @@ def _send_media(message, info: Any, audio: bool) -> None:
                         reply_to_message_id=message.message_id,
                         timeout=REQUEST_TIMEOUT,
                     )
-                    return
                 except Exception:
                     f.seek(0)
                     bot.send_document(
@@ -244,12 +261,9 @@ def _send_media(message, info: Any, audio: bool) -> None:
                         visible_file_name=os.path.basename(filepath),
                         timeout=REQUEST_TIMEOUT,
                     )
-                    return
         else:
-            # Document is more reliable than video for many sources and avoids
-            # Telegram video re-encoding / codec mismatch problems.
+            # Sending as document is more reliable than send_video for many sources.
             _send_as_document(message, filepath)
-
     except Exception as e:
         print("send failed:", e)
         raise
@@ -290,8 +304,6 @@ def _build_default_format_selector(audio: bool) -> str:
         return "bestaudio/best"
 
     limit_mb = max(1, UPLOAD_LIMIT_BYTES // (1024 * 1024))
-    # Prefer a smaller file first, then a smaller approximate size, then the worst
-    # available quality rather than risking a huge upload.
     return (
         f"best[filesize<{limit_mb}M]/"
         f"best[filesize_approx<{limit_mb}M]/"
@@ -414,7 +426,7 @@ def log(message, text: str, media: str):
 
         bot.send_message(
             config.logs,
-            f"Download request ({media}) from @{message.from_user.username} ({message.from_user.id})\n\n{chat_info}\n\n{text}",
+            f"Download request ({media}) from @{getattr(message.from_user, 'username', None)} ({message.from_user.id})\n\n{chat_info}\n\n{text}",
         )
 
 
@@ -451,16 +463,19 @@ def custom(message):
 
     msg = bot.reply_to(message, "Getting formats...")
 
-    with yt_dlp.YoutubeDL() as ydl:
+    with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
         info = ydl.extract_info(url, download=False)
 
     formats = info.get("formats") or []
 
-    data = {
-        f"{x.get('resolution', 'unknown')}.{x.get('ext', 'mp4')}": {"callback_data": f"{x['format_id']}"}
-        for x in formats
-        if x.get("video_ext") != "none"
-    }
+    data = {}
+    for x in formats:
+        if x.get("video_ext") == "none":
+            continue
+        res = x.get("resolution") or x.get("format_note") or "unknown"
+        ext = x.get("ext", "mp4")
+        label = f"{res}.{ext}"
+        data[label] = {"callback_data": f"{x['format_id']}"}
 
     markup = quick_markup(data, row_width=2)
 
@@ -485,6 +500,7 @@ def filter_cookies_by_domain(cookie_data: str) -> str:
 
         is_allowed = False
         for allowed_domain in ALLOWED_DOMAINS:
+            allowed_domain = allowed_domain.lower().strip()
             if domain == allowed_domain or domain.endswith("." + allowed_domain):
                 is_allowed = True
                 break
