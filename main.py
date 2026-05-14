@@ -23,9 +23,9 @@ os.makedirs(config.output_folder, exist_ok=True)
 
 UPLOAD_LIMIT_BYTES = 90 * 1024 * 1024
 REQUEST_TIMEOUT = 1800
-MAX_DOWNLOAD_BYTES = min(int(getattr(config, "max_filesize", 45 * 1024 * 1024) or 45 * 1024 * 1024), UPLOAD_LIMIT_BYTES)
+MAX_DOWNLOAD_BYTES = 40 * 1024 * 1024   # أقوى حد 40MB فقط (Replit + Telegram)
 
-# ========================== BULLETPROOF DOMAIN CHECKER ==========================
+# ========================== BULLETPROOF DOMAIN ==========================
 def is_allowed_domain(url):
     if not url or not isinstance(url, str):
         return False
@@ -70,7 +70,7 @@ def _make_progress_hook(message, msg):
             return
         try:
             last = last_edited.get(f"{message.chat.id}-{msg.message_id}")
-            if last and (datetime.datetime.now() - last).total_seconds() < 5:
+            if last and (datetime.datetime.now() - last).total_seconds() < 10:   # throttle 10 ثانية
                 return
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes") or 0
@@ -83,8 +83,8 @@ def _make_progress_hook(message, msg):
                 parse_mode="HTML",
             )
             last_edited[f"{message.chat.id}-{msg.message_id}"] = datetime.datetime.now()
-        except Exception as e:
-            print(e)
+        except Exception:
+            pass  # ignore "message not modified"
     return progress
 
 def _safe_file_size(path: str) -> int:
@@ -94,13 +94,15 @@ def _safe_file_size(path: str) -> int:
         return 0
 
 def _get_downloaded_filepath(info: Any) -> Optional[str]:
-    """Fixed: أقوى طريقة لجلب مسار الملف"""
-    for key in ("requested_downloads", "entries"):
-        downloads = info.get(key) or []
-        if downloads and isinstance(downloads, list):
-            fp = downloads[0].get("filepath") or downloads[0].get("__final_filename__")
-            if fp and os.path.exists(fp):
-                return fp
+    """أقوى طريقة لجلب المسار (fix path not found)"""
+    for k in ("requested_downloads", "entries"):
+        items = info.get(k) or []
+        if items and isinstance(items, list):
+            for item in items:
+                for key in ("filepath", "__final_filename__"):
+                    fp = item.get(key)
+                    if fp and os.path.exists(fp):
+                        return fp
     return info.get("filepath") or info.get("__final_filename__")
 
 def _send_as_document(message, filepath: str):
@@ -134,12 +136,7 @@ def _send_media(message, info: Any, audio: bool):
 
         try:
             with open(filepath, "rb") as f:
-                bot.send_video(
-                    message.chat.id, f,
-                    reply_to_message_id=message.message_id,
-                    supports_streaming=True,
-                    timeout=REQUEST_TIMEOUT,
-                )
+                bot.send_video(message.chat.id, f, reply_to_message_id=message.message_id, supports_streaming=True, timeout=REQUEST_TIMEOUT)
             return
         except Exception:
             bot.send_message(message.chat.id, "Trying document fallback...", reply_to_message_id=message.message_id)
@@ -165,17 +162,19 @@ def check_url(content: str, message):
         bot.reply_to(message, "Invalid URL")
         return {"success": False}
     if not is_allowed_domain(url):
-        bot.reply_to(message, "Invalid URL. Only YouTube, TikTok, Instagram, Twitter, Facebook and Bluesky + Dailymotion links are supported.")
+        bot.reply_to(message, "Invalid URL. Supported: YouTube, TikTok, Instagram, Twitter/X, Facebook, Dailymotion, Bluesky.")
         return {"success": False}
     return {"success": True, "url": url}
 
 def _build_default_format_selector(audio: bool):
-    """SUPER STRICT → دايماً أقل من 45MB عشان Replit + Telegram"""
+    """SUPER AGGRESSIVE لـ Facebook (40MB max + low quality)"""
     if audio:
         return "bestaudio/best"
     return (
-        "bestvideo[height<=480][filesize<45M]+bestaudio/bestvideo[height<=360][filesize<45M]+bestaudio/"
-        "best[height<=480][filesize<45M]/best[filesize<45M]/worst"
+        "bestvideo[height<=360][filesize<40M]+bestaudio/"
+        "bestvideo[height<=240][filesize<40M]+bestaudio/"
+        "best[height<=360][filesize<40M]/"
+        "best[filesize<40M]/worst"
     )
 
 def download_video(message, content, audio=False, format_id=None):
@@ -196,9 +195,9 @@ def download_video(message, content, audio=False, format_id=None):
         "max_filesize": MAX_DOWNLOAD_BYTES,
         "noplaylist": True,
         "merge_output_format": "mp4",
-        "retries": 15,
-        "extractor_retries": 15,
-        "format_sort": ["filesize", "height:480", "width:640"],
+        "retries": 20,
+        "extractor_retries": 20,
+        "format_sort": ["filesize", "height:360", "width"],   # مهم جداً لـ Facebook
         "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3"}] if audio else [],
         "prefer_free_formats": True,
         "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
@@ -226,12 +225,10 @@ def download_video(message, content, audio=False, format_id=None):
 
     except (DownloadError, ExtractorError) as e:
         err = str(e).lower()
-        if "404" in err or "not found" in err:
-            text = "Dailymotion link failed (temporary server issue). Try /custom or another quality."
+        if "larger than max-filesize" in err or "filesize" in err:
+            text = "File too large. Use /custom and choose smaller quality."
         elif any(x in err for x in ["login", "sign in", "rate-limit"]):
             text = "Rate limit or login required.\n\nارسل /cookie + ملف cookies.txt"
-        elif "larger than max-filesize" in err or "filesize" in err:
-            text = "File too large. Use /custom and choose smaller quality."
         else:
             text = "Download error, try again."
         bot.edit_message_text(text, message.chat.id, msg.message_id)
@@ -245,7 +242,7 @@ def download_video(message, content, audio=False, format_id=None):
             os.remove(cookie_file)
         _cleanup(video_title)
 
-# ========================== باقي الكود (نفس السابق بدون تغيير) ==========================
+# ========================== باقي الكود (نفس السابق) ==========================
 def log(message, text: str, media: str):
     if getattr(config, "logs", None):
         chat_info = "Private chat" if message.chat.type == "private" else f"Group: *{message.chat.title}* (`{message.chat.id}`)"
@@ -372,5 +369,5 @@ def handle_private_messages(message: types.Message):
     download_video(message, text)
 
 me = bot.get_me()
-print(f"ready as @{me.username} — YouTube + Dailymotion FIXED ✅ (45MB limit + 404 fix)")
+print(f"ready as @{me.username} — Facebook 471MB BUG KILLED ✅ (40MB strict + format_sort)")
 bot.infinity_polling()
