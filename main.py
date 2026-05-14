@@ -41,12 +41,10 @@ last_edited = {}
 
 
 def encrypt_cookie(cookie_data: str) -> str:
-    """Encrypt cookie data using the secret key."""
     return cipher.encrypt(cookie_data.encode()).decode()
 
 
 def decrypt_cookie(encrypted_data: str) -> str:
-    """Decrypt cookie data using the secret key."""
     return cipher.decrypt(encrypted_data.encode()).decode()
 
 
@@ -65,46 +63,48 @@ def youtube_url_validation(url):
 
 
 def is_allowed_domain(url):
-    """Check if URL belongs to allowed domains: YouTube, TikTok, Instagram, Twitter/X, Bluesky"""
+    """Check if URL belongs to allowed domains."""
     if not url or not isinstance(url, str):
         return False
-    
+
     url = url.lower().strip()
-    
+
     allowed = [
         "youtube.com", "youtu.be",
-        "tiktok.com", "vt.tiktok.com",       # TikTok short links
+        "tiktok.com", "vt.tiktok.com",
         "instagram.com", "instagr.am",
         "twitter.com", "x.com",
         "bluesky",
         "dailymotion.com",
         "facebook.com",
     ]
-    
+
     return any(domain in url for domain in allowed)
+
+
 def is_url(text: str) -> bool:
-    """Check if text is a valid URL"""
     if not text:
         return False
     text = text.strip().lower()
     return text.startswith(("http://", "https://"))
 
+
 @bot.message_handler(commands=["start", "help"])
 def test(message):
     bot.reply_to(
         message,
-        "*Send me a video link* and I'll download it for you, works with *YouTube*, *TikTok*, *Instagram*, *Twitter* and *Bluesky*.\n\n_Powered by_ [yt-dlp](https://github.com/yt-dlp/yt-dlp/)",
+        "*Send me a video link* and I'll download it for you, works with *YouTube*, *TikTok*, *Instagram*, *Twitter*, *Facebook* and *Bluesky*.\n\n_Powered by_ [yt-dlp](https://github.com/yt-dlp/yt-dlp/)",
         parse_mode="MARKDOWN",
         disable_web_page_preview=True,
     )
 
 
 def _validate_url(message, url: str) -> bool:
-    """Validate URL domain and YouTube-specific rules. Returns False and replies if invalid."""
+    """Validate URL domain and YouTube-specific rules."""
     if not is_allowed_domain(url):
         bot.reply_to(
             message,
-            "Invalid URL. Only YouTube, TikTok, Instagram, Twitter and Bluesky links are supported.",
+            "Invalid URL. Only YouTube, TikTok, Instagram, Twitter, Facebook and Bluesky links are supported.",
         )
         return False
 
@@ -133,12 +133,15 @@ def _make_progress_hook(message, msg) -> Callable:
             if last and (datetime.datetime.now() - last).total_seconds() < 5:
                 return
 
-            perc = round(d["downloaded_bytes"] * 100 / d["total_bytes"])
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes") or 0
+            perc = round(downloaded * 100 / total) if total else 0
+
             bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=msg.message_id,
                 text=(
-                    f"Downloading {d['info_dict']['title']}\n\n{perc}%\n\n"
+                    f"Downloading {d['info_dict'].get('title', 'file')}\n\n{perc}%\n\n"
                     f"<i>Want to stay updated? @SatoruStatus</i>"
                 ),
                 parse_mode="HTML",
@@ -150,32 +153,68 @@ def _make_progress_hook(message, msg) -> Callable:
     return progress
 
 
+def _send_as_document(message, filepath: str) -> None:
+    with open(filepath, "rb") as f:
+        bot.send_document(
+            message.chat.id,
+            f,
+            reply_to_message_id=message.message_id,
+            visible_file_name=os.path.basename(filepath),
+        )
+
+
 def _send_media(message, info: Any, audio: bool) -> None:
     """Send the downloaded file back to the user via Telegram."""
     downloads = info.get("requested_downloads") or []
-    filepath = downloads[0]["filepath"]
+    if not downloads:
+        raise RuntimeError("No downloaded file found")
 
-    with open(filepath, "rb") as f:
+    filepath = downloads[0].get("filepath")
+    if not filepath or not os.path.exists(filepath):
+        raise RuntimeError("Downloaded file path not found")
+
+    try:
         if audio:
-            bot.send_audio(message.chat.id, f, reply_to_message_id=message.message_id)
-        else:
+            with open(filepath, "rb") as f:
+                bot.send_audio(
+                    message.chat.id,
+                    f,
+                    reply_to_message_id=message.message_id,
+                )
+            return
+
+        # Try normal video send first
+        with open(filepath, "rb") as f:
             bot.send_video(
                 message.chat.id,
                 f,
                 reply_to_message_id=message.message_id,
-                width=downloads[0]["width"],
-                height=downloads[0]["height"],
+                width=downloads[0].get("width"),
+                height=downloads[0].get("height"),
+                supports_streaming=True,
             )
+    except Exception as e:
+        print("send_video/send_audio failed, fallback to document:", e)
+        _send_as_document(message, filepath)
 
 
 def _cleanup(video_title: int) -> None:
     """Remove all files in the output folder that belong to this download."""
-    for file in os.listdir(config.output_folder):
-        if file.startswith(str(video_title)):
-            os.remove(os.path.join(config.output_folder, file))
+    try:
+        for file in os.listdir(config.output_folder):
+            if file.startswith(str(video_title)):
+                try:
+                    os.remove(os.path.join(config.output_folder, file))
+                except FileNotFoundError:
+                    pass
+    except FileNotFoundError:
+        pass
 
 
 def check_url(content: str, message) -> dict:
+    if not content:
+        return {"success": False}
+
     match = re.search(r"https?://\S+", content)
     url = match.group(0) if match else content
 
@@ -230,7 +269,7 @@ def download_video(message, content, audio=False, format_id="mp4") -> None:
         if result:
             decrypted_data = decrypt_cookie(result[0])
             cookie_file = f"{config.output_folder}/cookies_{user_id}.txt"
-            with open(cookie_file, "w") as f:
+            with open(cookie_file, "w", encoding="utf-8") as f:
                 f.write(decrypted_data)
             ydl_opts["cookiefile"] = cookie_file
 
@@ -248,7 +287,6 @@ def download_video(message, content, audio=False, format_id="mp4") -> None:
 
     except (DownloadError, ExtractorError) as e:
         err = str(e).lower()
-        text: str
 
         if "[youtube]" in err and "sign in" in err:
             text = "We're sorry, YouTube is ratelimiting third party downloaders right now, try again later."
@@ -259,18 +297,20 @@ def download_video(message, content, audio=False, format_id="mp4") -> None:
 
         bot.edit_message_text(text, message.chat.id, msg.message_id)
 
-    except Exception:
+    except Exception as e:
+        print("Unexpected error:", e)
         bot.edit_message_text(
-            f"Couldn't send file — make sure it doesn't exceed "
-            f"*{round(config.max_filesize / 1_000_000)}MB* and is supported by Telegram.",
+            f"Couldn't send file — trying document fallback. If the file is too large, try a smaller quality.",
             message.chat.id,
             msg.message_id,
-            parse_mode="MARKDOWN",
         )
 
     finally:
         if cookie_file and os.path.exists(cookie_file):
-            os.remove(cookie_file)
+            try:
+                os.remove(cookie_file)
+            except FileNotFoundError:
+                pass
         _cleanup(video_title)
 
 
@@ -288,43 +328,13 @@ def log(message, text: str, media: str):
 
 
 def get_text(message):
-    if len(message.text.split(" ")) < 2:
+    text = message.text or ""
+    parts = text.split(" ")
+    if len(parts) < 2:
         if message.reply_to_message and message.reply_to_message.text:
             return message.reply_to_message.text
-        else:
-            return None
-    else:
-        return message.text.split(" ")[1]
-
-
-@bot.message_handler(
-    func=lambda m: True,
-    content_types=["text", "photo", "audio", "video", "document"],
-)
-def handle_private_messages(message: types.Message):
-    text = (
-        message.text if message.text else message.caption if message.caption else None
-    )
-    if message.chat.type != "private" or not text:
-        return
-
-    if not is_url(text):
-        bot.reply_to(message, "أرسل رابط صحيح يبدأ بـ http أو https")
-        return
-
-    # هنا يظهر الكيبورد (الحل النهائي)
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton("📥 تحميل الفيديو الكامل", callback_data="full"))
-    markup.add(types.InlineKeyboardButton("✂️ اقتصاص جزء من الفيديو", callback_data="trim"))
-   
-    bot.reply_to(
-        message,
-        "اختر ماذا تريد:",
-        reply_markup=markup
-    )
-
-    log(message, text, "video")
-    download_video(message, text)
+        return None
+    return parts[1]
 
 
 @bot.message_handler(commands=["audio"])
@@ -356,9 +366,9 @@ def custom(message):
     formats = info.get("formats") or []
 
     data = {
-        f"{x['resolution']}.{x['ext']}": {"callback_data": f"{x['format_id']}"}
+        f"{x.get('resolution', 'unknown')}.{x.get('ext', 'mp4')}": {"callback_data": f"{x['format_id']}"}
         for x in formats
-        if x["video_ext"] != "none"
+        if x.get("video_ext") != "none"
     }
 
     markup = quick_markup(data, row_width=2)
@@ -418,7 +428,7 @@ def handle_cookie(message):
             cookie_file = f"{config.output_folder}/cookies_{user_id}_temp.txt"
             try:
                 decrypted_data = decrypt_cookie(result[0])
-                with open(cookie_file, "w") as f:
+                with open(cookie_file, "w", encoding="utf-8") as f:
                     f.write(decrypted_data)
 
                 markup = types.InlineKeyboardMarkup()
@@ -454,7 +464,6 @@ def handle_cookie(message):
     cookie_data = downloaded_file.decode("utf-8")
 
     filtered_cookie_data = filter_cookies_by_domain(cookie_data)
-
     encrypted_data = encrypt_cookie(filtered_cookie_data)
 
     db_cursor.execute(
@@ -479,12 +488,20 @@ def callback(call):
             reply_markup=None,
         )
         bot.answer_callback_query(call.id, "Cookies deleted!")
-    elif call.message.reply_to_message:
+        return
+
+    if call.message.reply_to_message:
         if call.from_user.id == call.message.reply_to_message.from_user.id:
             url = get_text(call.message.reply_to_message)
+            if not url:
+                bot.answer_callback_query(call.id, "No URL found")
+                return
+
             bot.delete_message(call.message.chat.id, call.message.message_id)
             download_video(
-                call.message.reply_to_message, url, format_id=f"{call.data}+bestaudio"
+                call.message.reply_to_message,
+                url,
+                format_id=f"{call.data}+bestaudio",
             )
         else:
             bot.answer_callback_query(call.id, "You didn't send the request")
@@ -492,24 +509,22 @@ def callback(call):
 
 @bot.message_handler(
     func=lambda m: True,
-    content_types=[
-        "text",
-        "photo",
-        "audio",
-        "video",
-        "document",
-    ],
+    content_types=["text", "photo", "audio", "video", "document"],
 )
 def handle_private_messages(message: types.Message):
-    text = (
-        message.text if message.text else message.caption if message.caption else None
-    )
+    text = message.text if message.text else message.caption if message.caption else None
 
-    if message.chat.type == "private":
-        log(message, text or "<no text>", "video")
-        download_video(message, text)
+    if message.chat.type != "private" or not text:
         return
 
+    if not is_url(text):
+        bot.reply_to(message, "أرسل رابط صحيح يبدأ بـ http أو https")
+        return
 
-print(f"ready as @{bot.user.username}")
+    log(message, text, "video")
+    download_video(message, text)
+
+
+me = bot.get_me()
+print(f"ready as @{me.username}")
 bot.infinity_polling()
